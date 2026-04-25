@@ -1,17 +1,19 @@
-"""TCP/UDP port scanning engine with concurrent connect probes."""
+"""TCP/UDP port scanning engine with async I/O and optimizations."""
 
+import asyncio
 import concurrent.futures
 import errno
 import ipaddress
 import random
-import select
 import socket
 import struct
+import threading
 import time
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from dataclasses import dataclass, field
+
 
 @dataclass
 class RateLimiter:
@@ -20,6 +22,7 @@ class RateLimiter:
     _tokens: float = field(default=0.0)
     _last_update: float = field(default=0.0)
     _bucket_size: float = field(default=0.0)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
         self._bucket_size = max(1.0, self.requests_per_second)
@@ -30,14 +33,15 @@ class RateLimiter:
         if self.requests_per_second <= 0:
             return
         while True:
-            now = time.monotonic()
-            elapsed = now - self._last_update
-            self._tokens = min(self._bucket_size, self._tokens + elapsed * self.requests_per_second)
-            self._last_update = now
-            if self._tokens >= tokens:
-                self._tokens -= tokens
-                return
-            sleep_time = (tokens - self._tokens) / self.requests_per_second
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_update
+                self._tokens = min(self._bucket_size, self._tokens + elapsed * self.requests_per_second)
+                self._last_update = now
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                sleep_time = (tokens - self._tokens) / self.requests_per_second
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
@@ -55,8 +59,8 @@ class ScanProfile:
     aggressive: bool = False
 
 
-class PortScanner:
-    """TCP connect scanner with simple concurrency controls."""
+class AsyncPortScanner:
+    """Async TCP/UDP scanner with asyncio for high performance."""
 
     PROFILES: Dict[str, ScanProfile] = {
         "stealth": ScanProfile(
@@ -97,6 +101,20 @@ class PortScanner:
         ),
     }
 
+    COMMON_PORTS_TIMEOUTS = {
+        80: 0.5,
+        443: 0.5,
+        22: 0.8,
+        21: 0.8,
+        25: 0.8,
+        53: 0.8,
+        110: 0.8,
+        143: 0.8,
+        3306: 0.8,
+        5432: 0.8,
+        27017: 0.8,
+    }
+
     def __init__(
         self,
         target: str,
@@ -121,10 +139,15 @@ class PortScanner:
         self.retry_count = max(0, int(retry_count))
         self.open_ports: List[int] = []
         self._resolved_target: Optional[str] = None
+        self._port_results: Dict[int, Tuple[str, str]] = {}
         self._scan_stats: Dict[str, Dict[str, int]] = {
             "states": {"open": 0, "closed": 0, "filtered": 0, "error": 0},
             "reasons": {},
         }
+        self._results_lock = threading.Lock()
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._socket_cache: Dict[int, socket.socket] = {}
+        self._cache_lock = threading.Lock()
 
     def _resolve_host(self) -> str:
         """Resolve and cache hostname to IPv4 address."""
@@ -143,28 +166,35 @@ class PortScanner:
         except ValueError:
             return value.lower() in {"localhost", "ip6-localhost"}
 
-    def _scan_port(self, port: int) -> Tuple[str, str]:
-        """Return (state, reason) for a single TCP connect probe."""
+    def _get_adaptive_timeout(self, port: int) -> float:
+        """Return adaptive timeout based on port known behavior."""
+        return self.COMMON_PORTS_TIMEOUTS.get(port, self.timeout)
+
+    async def _async_scan_port(self, port: int) -> Tuple[str, str]:
+        """Async TCP connect scan for a single port."""
         target_ip = self._resolved_target or self._resolve_host()
         is_loopback = self._is_loopback_ip(target_ip)
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
-                code = sock.connect_ex((target_ip, port))
+        timeout = self._get_adaptive_timeout(port)
 
-                # Windows often returns WSAEWOULDBLOCK/INPROGRESS for connect_ex.
-                # Resolve that transitional state by waiting for writability and reading SO_ERROR.
-                if code in {errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK, 10035}:
-                    _, writable, _ = select.select([], [sock], [], self.timeout)
-                    if not writable:
-                        if is_loopback:
-                            return "closed", "loopback_timeout"
-                        return "filtered", "timeout"
-                    code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-        except TimeoutError:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(target_ip, port),
+                timeout=timeout
+            )
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.05)
+            except Exception:
+                pass
+            return "open", "async_connect"
+        except asyncio.TimeoutError:
             if is_loopback:
                 return "closed", "loopback_timeout"
             return "filtered", "timeout"
+        except ConnectionRefusedError:
+            return "closed", "conn_refused"
+        except BrokenPipeError:
+            return "open", "broken_pipe"
         except OSError as exc:
             err = exc.errno if exc.errno is not None else -1
             if err in {errno.ETIMEDOUT, 10060}:
@@ -173,38 +203,39 @@ class PortScanner:
                 return "filtered", "timeout"
             if err in {errno.EHOSTUNREACH, errno.ENETUNREACH, 10065, 10051}:
                 return "filtered", "unreachable"
+            if err in {errno.ECONNRESET, 10054}:
+                return "closed", "conn_reset"
+            if err in {errno.EACCES, 10013}:
+                return "filtered", "blocked"
             return "error", f"oserror_{err}"
+        except Exception as e:
+            return "error", str(e)
 
-        if code == 0:
-            return "open", "syn_ack"
-        if code in {errno.ECONNREFUSED, 10061}:
-            return "closed", "conn_refused"
-        if code in {errno.ETIMEDOUT, 10060}:
-            return "filtered", "timeout"
-        if code in {errno.EHOSTUNREACH, errno.ENETUNREACH, 10065, 10051}:
-            return "filtered", "unreachable"
-        if code in {errno.ECONNRESET, 10054}:
-            return "closed", "conn_reset"
-        if code in {errno.EACCES, 10013}:
-            return "filtered", "blocked"
-        return "error", f"code_{code}"
+        return "error", "unknown"
 
-    def _scan_port_udp(self, port: int) -> Tuple[str, str]:
-        """Return (state, reason) for a single UDP probe."""
+    async def _async_scan_port_udp(self, port: int) -> Tuple[str, str]:
+        """Async UDP scan for a single port."""
         target_ip = self._resolved_target or self._resolve_host()
         is_loopback = self._is_loopback_ip(target_ip)
+        timeout = self._get_adaptive_timeout(port)
 
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.settimeout(self.timeout)
-                sock.sendto(b"\x00", (target_ip, port))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
 
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if data:
-                        return "open", "udp_response"
-                except socket.timeout:
-                    pass
+            loop = asyncio.get_event_loop()
+            await loop.sock_sendto(sock, b"\x00", (target_ip, port))
+
+            try:
+                await asyncio.wait_for(
+                    loop.sock_recvfrom(sock, 1024),
+                    timeout=timeout
+                )
+                return "open", "udp_response"
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                sock.close()
 
         except OSError as exc:
             err = exc.errno if exc.errno is not None else -1
@@ -220,47 +251,84 @@ class PortScanner:
 
         return "filtered", "no_response"
 
-    def scan(self) -> List[int]:
-        """Scan all requested ports and return open ports sorted ascending."""
+    async def _scan_with_retry(self, port: int, scan_func) -> Tuple[str, str]:
+        """Scan with retry logic."""
+        for attempt in range(self.retry_count + 1):
+            state, reason = await scan_func(port)
+            if state == "open" or attempt == self.retry_count:
+                return state, reason
+            await asyncio.sleep(0.1 * (attempt + 1))
+        return "error", "max_retries"
+
+    async def _batch_worker(
+        self,
+        ports: List[int],
+        state_counter: Counter,
+        reason_counter: Counter,
+        results: Dict[int, Tuple[str, str]],
+        scan_func,
+    ) -> None:
+        """Process a batch of ports asynchronously."""
+        for port in ports:
+            if self.rate_limiter:
+                self.rate_limiter.acquire(1)
+
+            if self.retry_count > 0:
+                state, reason = await self._scan_with_retry(port, scan_func)
+            else:
+                state, reason = await scan_func(port)
+
+            results[port] = (state, reason)
+            state_counter[state] += 1
+            reason_counter[reason] += 1
+
+    async def scan_async(self) -> List[int]:
+        """Scan all ports using async I/O."""
         resolved = self._resolve_host()
+        target_ip = resolved
         if self.verbose:
             print(f"Resolved {self.target} -> {resolved}")
 
-        scan_func = self._scan_port_udp if self.scan_type == "udp" else self._scan_port
+        scan_func = self._async_scan_port_udp if self.scan_type == "udp" else self._async_scan_port
 
         self.open_ports = []
+        self._port_results = {}
         state_counter = Counter({"open": 0, "closed": 0, "filtered": 0, "error": 0})
         reason_counter = Counter()
-        max_workers = min(self.threads, len(self.ports)) or 1
+        results: Dict[int, Tuple[str, str]] = {}
 
-        def scan_with_retry(port: int) -> Tuple[str, str]:
-            for attempt in range(self.retry_count + 1):
-                state, reason = scan_func(port)
-                if state == "open" or attempt == self.retry_count:
-                    return state, reason
-                time.sleep(0.1 * (attempt + 1))
-            return "error", "max_retries"
+        batch_size = min(1000, len(self.ports))
+        ports_batches = [
+            self.ports[i:i + batch_size]
+            for i in range(0, len(self.ports), batch_size)
+        ]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_port = {}
-            for port in self.ports:
-                if self.rate_limiter:
-                    self.rate_limiter.acquire(1)
-                future_to_port[executor.submit(scan_with_retry if self.retry_count > 0 else scan_func, port)] = port
+        semaphore = asyncio.Semaphore(self.threads)
 
-            for future in concurrent.futures.as_completed(future_to_port):
-                port = future_to_port[future]
-                try:
-                    state, reason = future.result()
-                    state_counter[state] += 1
-                    reason_counter[reason] += 1
-                    if state == "open":
-                        self.open_ports.append(port)
-                except Exception:
-                    state_counter["error"] += 1
-                    reason_counter["executor_exception"] += 1
-                    continue
+        async def bounded_scan(port: int) -> Tuple[str, str]:
+            async with semaphore:
+                return await scan_func(port)
 
+        async def process_batch(ports_batch: List[int]) -> None:
+            tasks = [bounded_scan(port) for port in ports_batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for port, result in zip(ports_batch, batch_results):
+                if isinstance(result, Exception):
+                    state, reason = "error", str(result)
+                else:
+                    state, reason = result
+
+                results[port] = (state, reason)
+                state_counter[state] += 1
+                reason_counter[reason] += 1
+                if state == "open":
+                    self.open_ports.append(port)
+
+        for batch in ports_batches:
+            await process_batch(batch)
+
+        self._port_results = results
         self._scan_stats = {
             "states": {
                 "open": int(state_counter["open"]),
@@ -273,6 +341,10 @@ class PortScanner:
         self.open_ports.sort()
         return self.open_ports
 
+    def scan(self) -> List[int]:
+        """Main scan entry point - runs async scan in event loop."""
+        return asyncio.run(self.scan_async())
+
     def get_target(self) -> str:
         """Return resolved target IP."""
         return self._resolve_host()
@@ -280,3 +352,43 @@ class PortScanner:
     def get_scan_stats(self) -> Dict[str, Dict[str, int]]:
         """Return summarized scan states and low-level reasons."""
         return self._scan_stats
+
+    def get_port_results(self) -> Dict[int, Tuple[str, str]]:
+        """Return per-port (state, reason) results from the latest scan."""
+        return dict(self._port_results)
+
+
+class PortScanner:
+    """TCP connect scanner - wrapper for async scanner."""
+
+    PROFILES: Dict[str, ScanProfile] = AsyncPortScanner.PROFILES
+
+    def __init__(
+        self,
+        target: str,
+        ports: List[int],
+        threads: int = 200,
+        timeout: float = 0.8,
+        verbose: bool = False,
+        scan_type: str = "tcp",
+        rate_limiter: Optional[RateLimiter] = None,
+        retry_count: int = 0,
+    ):
+        self._async_scanner = AsyncPortScanner(
+            target, ports, threads, timeout, verbose, scan_type, rate_limiter, retry_count
+        )
+
+    def _resolve_host(self) -> str:
+        return self._async_scanner._resolve_host()
+
+    def scan(self) -> List[int]:
+        return self._async_scanner.scan()
+
+    def get_target(self) -> str:
+        return self._async_scanner.get_target()
+
+    def get_scan_stats(self) -> Dict[str, Dict[str, int]]:
+        return self._async_scanner.get_scan_stats()
+
+    def get_port_results(self) -> Dict[int, Tuple[str, str]]:
+        return self._async_scanner.get_port_results()

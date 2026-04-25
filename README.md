@@ -21,6 +21,10 @@ It fuses high-concurrency port scanning with asynchronous service fingerprinting
 - Proxy support: SOCKS5, SOCKS4, HTTP/HTTPS tunneling
 - Top Ports mode with presets (`--top-ports quick|standard|deep`) or numeric (`--top-ports N`)
 - Full sweep mode scanning all ports (`--all-ports`)
+- Retry control per port (`--retries N`) for unstable targets
+- Filtered-port confirmation pass (`--confirm-filtered`) to reduce false negatives
+- Confirmation cap for filtered ports (`--confirm-filtered-limit N`) to control runtime
+- Adaptive thread tuning based on scan size/protocol (faster full scans by default)
 - Hardened port parsing and validation (`1-65535`, invalid ranges rejected)
 - Asynchronous banner grabbing and fingerprinting on discovered open ports
 - Service version detection from banners (SSH/HTTP/SMTP/FTP/Redis/MySQL/PostgreSQL patterns)
@@ -155,6 +159,10 @@ python cli.py scan target -p 1-1000 -v
 
 # Hide banner
 python cli.py scan target --no-banner
+
+# Retry and filtered confirmation
+python cli.py scan target --all-ports --retries 2 --confirm-filtered
+python cli.py scan target --all-ports --retries 2 --confirm-filtered --confirm-filtered-limit 20000
 ```
 
 ## Command Options
@@ -164,10 +172,13 @@ python cli.py scan target --no-banner
 | `-p, --ports` | Port list/range | 1-1024 |
 | `--top-ports` | Scan top N ports | - |
 | `--all-ports` | Scan all ports (1-65535) | - |
-| `-t, --threads` | Max worker threads | 200 |
+| `-t, --threads` | Max worker threads | adaptive |
 | `--timeout` | Socket timeout (seconds) | 0.8 |
 | `--scan-type` | Protocol: tcp or udp | tcp |
 | `--profile` | Scan profile | - |
+| `--retries` | Retry attempts per port | 0 |
+| `--confirm-filtered` | Rescan filtered ports once | - |
+| `--confirm-filtered-limit` | Max filtered ports to confirm | 5000 |
 | `--rate-limit` | Requests per second | unlimited |
 | `--proxy` | Proxy URL | - |
 | `--no-detect` | Skip detection | - |

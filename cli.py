@@ -149,6 +149,25 @@ def resolve_top_ports(value: str) -> tuple[int, str]:
     return amount, str(amount)
 
 
+def recommend_threads(port_count: int, scan_type: str) -> int:
+    """Return adaptive thread count tuned for scan size and protocol."""
+    protocol = (scan_type or "tcp").lower()
+    if protocol == "udp":
+        if port_count >= 10000:
+            return 350
+        if port_count >= 1000:
+            return 220
+        return 150
+
+    if port_count >= 50000:
+        return 600
+    if port_count >= 10000:
+        return 450
+    if port_count >= 1000:
+        return 300
+    return 200
+
+
 def normalize_target(target_input: str) -> str:
     """Normalize user target into a hostname/IP accepted by socket APIs."""
     target = (target_input or "").strip()
@@ -228,8 +247,8 @@ Note: Use only on systems you have authorization to test.
         "-t",
         "--threads",
         type=int,
-        default=200,
-        help="Maximum worker threads for port scan (default: 200)",
+        default=None,
+        help="Maximum worker threads for port scan (default: adaptive by scan size)",
     )
     scan_parser.add_argument(
         "--timeout",
@@ -262,6 +281,23 @@ Note: Use only on systems you have authorization to test.
         "--profile",
         choices=("stealth", "normal", "aggressive", "parallel"),
         help="Use scan profile preset (overrides -t, --timeout, --rate-limit)",
+    )
+    scan_parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Retry attempts per port when not open (default: 0)",
+    )
+    scan_parser.add_argument(
+        "--confirm-filtered",
+        action="store_true",
+        help="Rescan filtered ports once to reduce false negatives",
+    )
+    scan_parser.add_argument(
+        "--confirm-filtered-limit",
+        type=int,
+        default=5000,
+        help="Maximum filtered ports to rescan on confirmation pass (default: 5000)",
     )
     scan_parser.add_argument(
         "--rate-limit",
@@ -701,10 +737,12 @@ def main() -> None:
         print_banner()
 
     try:
-        if args.threads < 1:
-            raise ValueError("Threads must be >= 1.")
         if args.timeout <= 0:
             raise ValueError("Timeout must be > 0.")
+        if args.retries < 0:
+            raise ValueError("Retries must be >= 0.")
+        if args.confirm_filtered_limit < 1:
+            raise ValueError("Confirm-filtered-limit must be >= 1.")
 
         if args.proxy:
             print_info(f"[*] Using proxy: {args.proxy}")
@@ -730,6 +768,12 @@ def main() -> None:
             chosen_ports = args.ports if args.ports else DEFAULT_PORT_RANGE
             ports = parse_ports(chosen_ports)
             scan_ports_label = chosen_ports
+
+        if args.threads is None:
+            args.threads = profile.threads if profile else recommend_threads(len(ports), args.scan_type)
+            print_info(f"[*] Adaptive threads selected: {args.threads}")
+        if args.threads < 1:
+            raise ValueError("Threads must be >= 1.")
         normalized_target = normalize_target(args.target)
 
         rate_limiter = None
@@ -737,7 +781,8 @@ def main() -> None:
             rate_limiter = RateLimiter(requests_per_second=args.rate_limit)
             print_info(f"[*] Rate limit: {args.rate_limit} req/s")
 
-        retry_count = 1 if args.profile and profile and profile.retry_count > 0 else 0
+        profile_retry = profile.retry_count if profile else 0
+        retry_count = max(args.retries, profile_retry)
 
         scanner = PortScanner(
             normalized_target,
@@ -760,6 +805,35 @@ def main() -> None:
         open_ports = scanner.scan()
         scan_elapsed = (datetime.now() - scan_start).total_seconds()
         scan_stats = scanner.get_scan_stats()
+        port_results = scanner.get_port_results()
+
+        if args.confirm_filtered and args.scan_type == "tcp":
+            filtered_ports = sorted(port for port, result in port_results.items() if result[0] == "filtered")
+            if filtered_ports:
+                if len(filtered_ports) > args.confirm_filtered_limit:
+                    original_count = len(filtered_ports)
+                    filtered_ports = filtered_ports[: args.confirm_filtered_limit]
+                    print_warning(
+                        f">>> Confirmation limited to first {len(filtered_ports)} filtered ports "
+                        f"(of {original_count}). Increase --confirm-filtered-limit to expand."
+                    )
+                print_info(f"[*] Confirming {len(filtered_ports)} filtered ports with a second pass...")
+                confirm_start = datetime.now()
+                confirm_scanner = PortScanner(
+                    normalized_target,
+                    filtered_ports,
+                    args.threads,
+                    args.timeout,
+                    args.verbose,
+                    scan_type=args.scan_type,
+                    rate_limiter=rate_limiter,
+                    retry_count=max(1, retry_count),
+                )
+                confirmed_open_ports = confirm_scanner.scan()
+                if confirmed_open_ports:
+                    open_ports = sorted(set(open_ports).union(confirmed_open_ports))
+                    print_info(f"[*] Confirmation promoted {len(confirmed_open_ports)} port(s) to open.")
+                scan_elapsed += (datetime.now() - confirm_start).total_seconds()
 
         print()
         print_success(f"Strike complete in {scan_elapsed:.2f}s")
