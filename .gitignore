@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Scan/report artifacts
+ghostscan_report_*.txt
+ghostscan_report_*.json
+ghostscan_report_*.csv
+ghostscan_*_test.*
+ghostscan_fw_check*.json
