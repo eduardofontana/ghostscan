@@ -19,7 +19,7 @@ from urllib import error as url_error
 from urllib import request as url_request
 from urllib.parse import urlsplit
 
-from scanner import PortScanner
+from scanner import PortScanner, RateLimiter, ScanProfile
 from services import ServiceDetector
 from utils import (
     print_banner,
@@ -30,6 +30,12 @@ from utils import (
     print_success,
     print_warning,
 )
+from proxies import parse_proxy_string
+
+try:
+    from html_report import generate_html_report as _generate_html_report
+except ImportError:
+    _generate_html_report = None
 
 MIN_PORT = 1
 MAX_PORT = 65535
@@ -173,14 +179,29 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         prog="ghostscan",
-        description="GhostScan CLI - aggressive TCP recon with async fingerprinting and version detection",
+        description="GhostScan CLI - aggressive TCP/UDP recon with async fingerprinting and version detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  ghostscan scan 127.0.0.1 -p 1-1024\n"
-            "  ghostscan scan scanme.nmap.org -p 22,80,443 -t 200\n"
-            "  ghostscan scan https://example.com -p 80,443 --detect-waf --output json"
-        ),
+        epilog="""
+Examples:
+  Basic scan:
+    ghostscan scan 127.0.0.1 -p 1-1024
+    ghostscan scan scanme.nmap.org -p 22,80,443 -t 200
+
+  Scan types and profiles:
+    ghostscan scan target --scan-type udp -p 53,161
+    ghostscan scan target --profile stealth
+    ghostscan scan target --profile aggressive
+
+  Rate limiting and proxy:
+    ghostscan scan target --rate-limit 10
+    ghostscan scan target --proxy socks5://127.0.0.1:1080 -p 22,80
+
+  Output formats:
+    ghostscan scan target -p 1-1000 --output html
+    ghostscan scan target --output json --output-file results.json
+
+Note: Use only on systems you have authorization to test.
+""",
     )
     parser.add_argument("--version", action="version", version="ghostscan 1.2.0")
 
@@ -227,8 +248,29 @@ def parse_args() -> argparse.Namespace:
         help="Enable fast WAF fingerprinting on discovered web endpoints",
     )
     scan_parser.add_argument(
+        "--scan-type",
+        choices=("tcp", "udp"),
+        default="tcp",
+        help="Scan protocol type (default: tcp)",
+    )
+    scan_parser.add_argument(
+        "--profile",
+        choices=("stealth", "normal", "aggressive", "parallel"),
+        help="Use scan profile preset (overrides -t, --timeout, --rate-limit)",
+    )
+    scan_parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=0.0,
+help="Rate limit in requests per second (default: unlimited)",
+    )
+    scan_parser.add_argument(
+        "--proxy",
+        help="Proxy URL (e.g., socks5://127.0.0.1:1080 or http://proxy:8080)",
+    )
+    scan_parser.add_argument(
         "--output",
-        choices=("txt", "json", "csv"),
+        choices=("txt", "json", "csv", "html"),
         default="txt",
         help="Final report format (default: txt)",
     )
@@ -264,6 +306,7 @@ def _build_report_data(
     detect_enabled: bool,
     firewall_assessment: Optional[Dict[str, Any]] = None,
     waf_assessment: Optional[Dict[str, Any]] = None,
+scan_type: str = "tcp",
 ) -> Dict[str, Any]:
     service_counter: Counter[str] = Counter()
     for port in open_ports:
@@ -298,6 +341,7 @@ def _build_report_data(
             "ports_scanned": len(ports),
             "open_ports_count": len(open_ports),
             "detection_enabled": detect_enabled,
+            "scan_type": scan_type,
         },
         "summary": {
             "services_detected": dict(service_counter),
@@ -597,6 +641,10 @@ def _export_report(args: argparse.Namespace, payload: Dict[str, Any]) -> Path:
         _write_json_report(path, payload)
     elif ext == "csv":
         _write_csv_report(path, payload)
+    elif ext == "html":
+        if _generate_html_report is None:
+            raise ValueError("HTML report not available. Install template engine if needed.")
+        _generate_html_report(payload, path)
     else:
         _write_text_report(path, payload)
 
@@ -653,6 +701,19 @@ def main() -> None:
         if args.timeout <= 0:
             raise ValueError("Timeout must be > 0.")
 
+        if args.proxy:
+            print_info(f"[*] Using proxy: {args.proxy}")
+
+        profile = None
+        if args.profile:
+            profile = PortScanner.PROFILES.get(args.profile)
+            if profile:
+                print_info(f"[*] Using profile: {args.profile} - {profile.description}")
+                args.threads = profile.threads
+                args.timeout = profile.timeout
+                if profile.rate_limit > 0:
+                    args.rate_limit = profile.rate_limit
+
         if args.top_ports is not None:
             top_count, top_label = resolve_top_ports(args.top_ports)
             ports = get_top_ports(top_count)
@@ -662,11 +723,29 @@ def main() -> None:
             ports = parse_ports(chosen_ports)
             scan_ports_label = chosen_ports
         normalized_target = normalize_target(args.target)
-        scanner = PortScanner(normalized_target, ports, args.threads, args.timeout, args.verbose)
+
+        rate_limiter = None
+        if args.rate_limit > 0:
+            rate_limiter = RateLimiter(requests_per_second=args.rate_limit)
+            print_info(f"[*] Rate limit: {args.rate_limit} req/s")
+
+        retry_count = 1 if args.profile and profile and profile.retry_count > 0 else 0
+
+        scanner = PortScanner(
+            normalized_target,
+            ports,
+            args.threads,
+            args.timeout,
+            args.verbose,
+            scan_type=args.scan_type,
+            rate_limiter=rate_limiter,
+            retry_count=retry_count,
+        )
         resolved_target = scanner.get_target()
 
+        scan_type_display = args.scan_type.upper()
         print_scan_header(normalized_target, resolved_target, scan_ports_label, len(ports), args.threads, args.timeout)
-        print_warning(">>> Weaponizing scan threads and priming sockets...\n")
+        print_warning(f">>> Weaponizing {scan_type_display} scan threads and priming sockets...\n")
 
         operation_started = datetime.now()
         scan_start = datetime.now()
@@ -690,7 +769,7 @@ def main() -> None:
                         "service": "OPEN",
                         "version": "",
                         "banner": "",
-                        "transport": "tcp",
+                        "transport": args.scan_type,
                         "confidence": 0.3,
                         "probe_used": False,
                     }
@@ -727,6 +806,7 @@ def main() -> None:
             detect_enabled=not args.no_detect,
             firewall_assessment=firewall_assessment,
             waf_assessment=waf_assessment,
+            scan_type=args.scan_type,
         )
 
         print()
