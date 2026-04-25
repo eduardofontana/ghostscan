@@ -88,11 +88,12 @@ def print_warning(msg: str) -> None:
     print_color(f"[*] {msg}", HC.YB)
 
 
-def print_scan_header(target: str, ports: str, count: int, threads: int, timeout: float) -> None:
+def print_scan_header(target: str, target_ip: str, ports: str, count: int, threads: int, timeout: float) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print_color("  [ STRIKE PROFILE ]", HC.MB)
     print_color("  " + ("=" * 42), HC.MD)
     print_color(f"  {HC.WB}Target   {HC.GD}: {target}", HC.WB)
+    print_color(f"  {HC.WB}IP       {HC.GD}: {target_ip}", HC.WB)
     print_color(f"  {HC.WB}Ports    {HC.GD}: {ports} ({count} vectors)", HC.WB)
     print_color(f"  {HC.WB}Threads  {HC.GD}: {threads}", HC.WB)
     print_color(f"  {HC.WB}Timeout  {HC.GD}: {timeout:.2f}s", HC.WB)

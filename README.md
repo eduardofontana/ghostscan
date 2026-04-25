@@ -82,6 +82,8 @@ Sample output flow:
 
 ```text
 [ STRIKE PROFILE ]
+  Target   : target.local
+  IP       : 203.0.113.10
 [*] >>> Weaponizing scan threads and priming sockets...
 [+] Strike complete in 0.42s
 [*] >>> BREACH POINTS IDENTIFIED:
@@ -89,6 +91,7 @@ Sample output flow:
   [OPEN]     80  ->  HTTP nginx/1.24.0 (conf 0.90)
 [*] >>> FINAL OPERATION REPORT
 [::] Runtime: 0.42s | Breach points: 2
+[::] Firewall presence: YES
 [+] Report exported: /path/to/ghostscan_report_20260425_101230.txt
 ```
 

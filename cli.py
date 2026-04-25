@@ -383,9 +383,21 @@ def _assess_firewall(scan_stats: Dict[str, Dict[str, int]], total_ports: int, ta
     else:
         verdict = "unlikely"
 
+    behind_firewall = verdict in {"likely", "possible"}
+    if filtered_count == 0 and blocked_count == 0 and timeout_count == 0:
+        firewall_type = "none-observed"
+    elif blocked_count > 0:
+        firewall_type = "active-reject-filter"
+    elif filtered_count > 0 and timeout_count > 0:
+        firewall_type = "silent-drop-filter"
+    else:
+        firewall_type = "network-filter-possible"
+
     return {
         "enabled": True,
+        "behind_firewall": behind_firewall,
         "verdict": verdict,
+        "firewall_type": firewall_type,
         "score": score,
         "confidence": confidence,
         "states": {
@@ -449,7 +461,6 @@ def _detect_waf(target: str, open_ports: List[int], timeout: float) -> Dict[str,
             endpoints.append(f"{scheme}://{target}:{port}/")
 
     signals: List[str] = []
-    vendors: List[str] = []
     score = 0
     tested: List[str] = []
 
@@ -478,10 +489,8 @@ def _detect_waf(target: str, open_ports: List[int], timeout: float) -> Dict[str,
 
         for vendor, patterns in fingerprints.items():
             if any(pattern in combined for pattern in patterns):
-                if vendor not in vendors:
-                    vendors.append(vendor)
                 score += 25
-                signals.append(f"{vendor} signature on {endpoint}")
+                signals.append(f"WAF signature matched on {endpoint}")
 
     score = max(0, min(99, score))
     detected = score >= 25
@@ -492,7 +501,6 @@ def _detect_waf(target: str, open_ports: List[int], timeout: float) -> Dict[str,
         "detected": detected,
         "confidence": confidence,
         "score": score,
-        "vendors": vendors,
         "signals": signals[:10],
         "tested_endpoints": tested,
     }
@@ -562,25 +570,13 @@ def _write_text_report(path: Path, payload: Dict[str, Any]) -> None:
     firewall = summary.get("firewall_assessment", {})
     if firewall.get("enabled"):
         lines.extend(["", "FIREWALL HEURISTIC", "-" * 44])
-        lines.append(
-            f"Verdict: {firewall.get('verdict', 'unknown')} "
-            f"(score={firewall.get('score', 0)}, conf={firewall.get('confidence', 0):.2f})"
-        )
-        fw_states = firewall.get("states", {})
-        lines.append(
-            "State distribution: "
-            f"open={fw_states.get('open', 0)}, closed={fw_states.get('closed', 0)}, "
-            f"filtered={fw_states.get('filtered', 0)}, error={fw_states.get('error', 0)}"
-        )
-        for signal in firewall.get("signals", [])[:6]:
-            lines.append(f"- {signal}")
+        lines.append(f"Firewall present: {'yes' if firewall.get('behind_firewall') else 'no'}")
 
     waf = summary.get("waf_assessment", {})
     if waf.get("enabled"):
         lines.extend(["", "WAF FINGERPRINT", "-" * 44])
         if waf.get("detected"):
-            vendors = ", ".join(waf.get("vendors", [])) if waf.get("vendors") else "Unknown vendor"
-            lines.append(f"Detected: yes | Vendors: {vendors} | Confidence: {waf.get('confidence', 0):.2f}")
+            lines.append(f"Detected: yes | Confidence: {waf.get('confidence', 0):.2f}")
         else:
             lines.append(f"Detected: no | Confidence: {waf.get('confidence', 0):.2f}")
         for signal in waf.get("signals", [])[:6]:
@@ -633,16 +629,13 @@ def _print_professional_report(payload: Dict[str, Any]) -> None:
 
     firewall = summary.get("firewall_assessment", {})
     if firewall.get("enabled"):
-        print_info(
-            f"Firewall heuristic: {firewall.get('verdict', 'unknown')} "
-            f"(score={firewall.get('score', 0)}, conf={firewall.get('confidence', 0):.2f})"
-        )
+        presence = "YES" if firewall.get("behind_firewall") else "NO"
+        print_info(f"Firewall presence: {presence}")
 
     waf = summary.get("waf_assessment", {})
     if waf.get("enabled"):
         if waf.get("detected"):
-            vendors = ", ".join(waf.get("vendors", [])) if waf.get("vendors") else "Unknown vendor"
-            print_warning(f">>> WAF fingerprint detected: {vendors} (conf={waf.get('confidence', 0):.2f})")
+            print_warning(f">>> WAF fingerprint detected (conf={waf.get('confidence', 0):.2f})")
         else:
             print_info(f"WAF fingerprint: not detected (conf={waf.get('confidence', 0):.2f})")
 
@@ -669,11 +662,11 @@ def main() -> None:
             ports = parse_ports(chosen_ports)
             scan_ports_label = chosen_ports
         normalized_target = normalize_target(args.target)
-
-        print_scan_header(normalized_target, scan_ports_label, len(ports), args.threads, args.timeout)
-        print_warning(">>> Weaponizing scan threads and priming sockets...\n")
-
         scanner = PortScanner(normalized_target, ports, args.threads, args.timeout, args.verbose)
+        resolved_target = scanner.get_target()
+
+        print_scan_header(normalized_target, resolved_target, scan_ports_label, len(ports), args.threads, args.timeout)
+        print_warning(">>> Weaponizing scan threads and priming sockets...\n")
 
         operation_started = datetime.now()
         scan_start = datetime.now()
@@ -701,25 +694,22 @@ def main() -> None:
                         "confidence": 0.3,
                         "probe_used": False,
                     }
-                    if args.output == "txt":
-                        print_open_port(port, "OPEN (fingerprint bypassed)")
+                    print_open_port(port, "OPEN (fingerprint bypassed)")
             else:
                 print_warning(">>> Running async fingerprinting and version extraction...")
-                service_data = _detect_services_async(scanner.get_target(), open_ports, args.timeout)
+                service_data = _detect_services_async(resolved_target, open_ports, args.timeout)
                 for port in open_ports:
                     row = service_data.get(port, {"service": "Unknown", "version": "", "confidence": 0.0})
                     service_label = row["service"]
                     if row.get("version"):
                         service_label = f"{service_label} {row['version']}"
                     service_label = f"{service_label} (conf {row.get('confidence', 0):.2f})"
-                    if args.output == "txt":
-                        print_open_port(port, service_label)
+                    print_open_port(port, service_label)
         else:
             print_warning(">>> Surface hardened: no open ports detected")
 
         operation_finished = datetime.now()
         total_elapsed = (operation_finished - operation_started).total_seconds()
-        resolved_target = scanner.get_target()
         firewall_assessment = _assess_firewall(scan_stats, len(ports), resolved_target) if args.detect_firewall else {}
         waf_assessment = _detect_waf(resolved_target, open_ports, args.timeout) if args.detect_waf else {}
 
