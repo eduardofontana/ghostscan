@@ -1,5 +1,7 @@
 # GhostScan
 
+![GhostScan](ghostscan.png)
+
 GhostScan is an aggressive TCP/UDP recon CLI forged for red-team style enumeration drills.
 It fuses high-concurrency port scanning with asynchronous service fingerprinting (banner probes + TLS checks) to expose breach points fast.
 
