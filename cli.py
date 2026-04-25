@@ -219,6 +219,11 @@ Note: Use only on systems you have authorization to test.
         "--top-ports",
         help="Scan top ports by preset or number: quick|standard|deep|N (example: --top-ports standard)",
     )
+    scan_mode.add_argument(
+        "--all-ports",
+        action="store_true",
+        help="Scan all possible ports (1-65535)",
+    )
     scan_parser.add_argument(
         "-t",
         "--threads",
@@ -718,6 +723,9 @@ def main() -> None:
             top_count, top_label = resolve_top_ports(args.top_ports)
             ports = get_top_ports(top_count)
             scan_ports_label = f"top-{top_label}"
+        elif args.all_ports:
+            ports = list(range(MIN_PORT, MAX_PORT + 1))
+            scan_ports_label = f"{MIN_PORT}-{MAX_PORT}"
         else:
             chosen_ports = args.ports if args.ports else DEFAULT_PORT_RANGE
             ports = parse_ports(chosen_ports)

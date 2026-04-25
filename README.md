@@ -20,6 +20,7 @@ It fuses high-concurrency port scanning with asynchronous service fingerprinting
 - Rate limiting to control scan speed (requests per second)
 - Proxy support: SOCKS5, SOCKS4, HTTP/HTTPS tunneling
 - Top Ports mode with presets (`--top-ports quick|standard|deep`) or numeric (`--top-ports N`)
+- Full sweep mode scanning all ports (`--all-ports`)
 - Hardened port parsing and validation (`1-65535`, invalid ranges rejected)
 - Asynchronous banner grabbing and fingerprinting on discovered open ports
 - Service version detection from banners (SSH/HTTP/SMTP/FTP/Redis/MySQL/PostgreSQL patterns)
@@ -66,6 +67,7 @@ python cli.py scan 127.0.0.1 --top-ports quick
 python cli.py scan 127.0.0.1 --top-ports standard
 python cli.py scan 127.0.0.1 --top-ports deep
 python cli.py scan 127.0.0.1 --top-ports 100
+python cli.py scan 127.0.0.1 --all-ports
 ```
 
 ### Scan Types
@@ -161,6 +163,7 @@ python cli.py scan target --no-banner
 |--------|------------|---------|
 | `-p, --ports` | Port list/range | 1-1024 |
 | `--top-ports` | Scan top N ports | - |
+| `--all-ports` | Scan all ports (1-65535) | - |
 | `-t, --threads` | Max worker threads | 200 |
 | `--timeout` | Socket timeout (seconds) | 0.8 |
 | `--scan-type` | Protocol: tcp or udp | tcp |
