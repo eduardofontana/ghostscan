@@ -19,7 +19,7 @@ It fuses high-concurrency port scanning with asynchronous service fingerprinting
 - Service version detection from banners (SSH/HTTP/SMTP/FTP/Redis/MySQL/PostgreSQL patterns)
 - Detection pipeline: banner grab, protocol-aware probes (HTTP/SMTP/POP3/IMAP/Redis), TLS confirmation
 - Optional WAF fingerprinting (`--detect-waf`) via safe HTTP header/body signatures
-- Optional firewall heuristic (`--detect-firewall`) with score/confidence in final report
+- Optional quiet firewall check (`--detect-firewall`) with binary presence output (`YES/NO`)
 - Professional final report with service density and high-risk exposure snapshot
 - Structured export: `--output txt|json|csv` with optional `--output-file`
 - Matrix-style terminal output with graceful no-color fallback
@@ -70,7 +70,7 @@ Options:
 - `-t, --threads`: Max scan workers (default: `200`)
 - `--timeout`: Socket timeout in seconds (default: `0.8`)
 - `--no-detect`: Skip service detection for maximum speed
-- `--detect-firewall`: Enable firewall heuristic analysis with score/confidence
+- `--detect-firewall`: Enable quiet firewall presence check (`YES/NO`)
 - `--detect-waf`: Enable fast WAF fingerprinting on web endpoints
 - `--output`: Report format: `txt`, `json`, or `csv` (default: `txt`)
 - `--output-file`: Explicit report filename/path
